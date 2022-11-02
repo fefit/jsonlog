@@ -6,11 +6,12 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 
 type JsonData = HashMap<String, JsonValue>;
 type BoxDynOutputFn = Box<dyn Fn(&JsonData) -> String + Send + Sync>;
 type BoxDynCondFn = Box<dyn Fn(&JsonData) -> bool + Send + Sync>;
+
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,15 +33,15 @@ struct Args {
   cond: Option<String>,
 
   /// The parallel count for output data.
-  #[arg(short = 'p', long, default_value_t = 4)]
-  par: usize,
+  #[arg(short = 'p', long)]
+  par: Option<usize>,
 
   /// The count of rows should be shown
   #[arg(short = 'n', long)]
   num: Option<usize>,
 
   /// The log file.
-  file: String,
+  file: Option<String>,
 }
 
 /**
@@ -86,7 +87,7 @@ impl From<ProxyValue> for EvalValue {
 }
 
 /**
- *
+ * Buffered Output
  *
  */
 struct BufferedOutput {
@@ -95,6 +96,8 @@ struct BufferedOutput {
   cap: usize,
   data: Vec<String>,
   rows: usize,
+  last_index: usize,
+  non_first: bool,
 }
 
 impl BufferedOutput {
@@ -104,11 +107,13 @@ impl BufferedOutput {
   fn new(cap: usize, output_fn: BoxDynOutputFn, cond_fn: BoxDynCondFn) -> Self {
     let cap = cap.min(1);
     BufferedOutput {
-      cap: cap.min(1),
+      cap,
+      last_index: cap - 1,
       cond_fn,
       output_fn,
-      data: Vec::with_capacity(cap),
+      data: vec![String::new(); cap],
       rows: 0,
+      non_first: false,
     }
   }
   /**
@@ -120,6 +125,7 @@ impl BufferedOutput {
     self.data.par_iter().for_each(|r| {
       if let Ok(json) = serde_json::from_str::<JsonData>(r) {
         if cond_fn(&json) {
+          println!();
           print!("{}", output_fn(&json));
         }
       }
@@ -129,22 +135,22 @@ impl BufferedOutput {
    * push data
    */
   fn push(&mut self, row: String) {
-    if self.rows == 0 {
+    if self.non_first {
+      let index = self.rows % self.cap;
+      self.data[index] = row;
+      self.rows += 1;
+      if index == self.last_index {
+        self.end();
+      }
+    } else {
       let cond_fn = &mut self.cond_fn;
       let output_fn = &self.output_fn;
       if let Ok(json) = serde_json::from_str::<JsonData>(&row) {
         if cond_fn(&json) {
-          println!();
           print!("{}", output_fn(&json));
         }
       }
-    } else {
-      let index = self.rows % self.cap;
-      self.data[index] = row;
-      self.rows += 1;
-      if self.rows == self.cap {
-        self.end();
-      }
+      self.non_first = true;
     };
   }
 }
@@ -178,7 +184,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             let expr = evalexpr::build_operator_tree(&cur_str)?;
             output_fns.push(Box::new(move |data: &JsonData| {
               let mut ctx_disp = context_map! {
-                "__len__" => 1
+                "_len_" => Function::new(|argument| {
+                  if let Ok(s) = argument.as_string() {
+                    return Ok(EvalValue::Int(s.len() as i64));
+                  }
+                  Ok(argument.clone())
+                })
               }
               .unwrap();
               for (key, value) in data.iter() {
@@ -186,7 +197,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                   .set_value(key.into(), ProxyValue::from(value).into())
                   .unwrap();
               }
-              format!("{}", expr.eval_with_context(&ctx_disp).unwrap())
+              if let Ok(value) = expr.eval_with_context(&ctx_disp) {
+                match value {
+                  EvalValue::String(s) => s,
+                  v => format!("{}", v),
+                }
+              } else {
+                String::new()
+              }
             }));
             cur_str = String::new();
             is_expr = false;
@@ -243,7 +261,12 @@ fn main() -> Result<(), Box<dyn Error>> {
       .map_err(|e| format!("The --cond argument uses an unsupported expression:{}", e))?;
     Box::new(move |data: &JsonData| {
       let mut ctx_cond = context_map! {
-        "__len__" => 1
+        "_len_" => Function::new(|argument| {
+          if let Ok(s) = argument.as_string() {
+            return Ok(EvalValue::Int(s.len() as i64));
+          }
+          Ok(EvalValue::Int(0))
+        })
       }
       .unwrap();
       for (key, value) in data.iter() {
@@ -257,38 +280,76 @@ fn main() -> Result<(), Box<dyn Error>> {
   } else {
     Box::new(|_: &JsonData| true)
   };
-  //
-  let mut buf_output = BufferedOutput::new(args.par, output_fn, cond_fn);
-  // get the split string array
+  // buffered output
+  let mut buf_output =
+    BufferedOutput::new(args.par.unwrap_or_else(num_cpus::get), output_fn, cond_fn);
+  // read the logs from file
   if args.split == "\n" {
-    let file = File::open(args.file)?;
-    let reader = BufReader::new(file);
-    if start_index == 0 {
-      for line in reader.lines() {
-        buf_output.push(line?);
+    if let Some(args_file) = args.file {
+      let file = File::open(args_file)?;
+      let reader = BufReader::new(file);
+      if start_index == 0 {
+        for line in reader.lines() {
+          buf_output.push(line?);
+        }
+      } else {
+        for line in reader.lines().skip(start_index) {
+          buf_output.push(line?);
+        }
       }
     } else {
-      for line in reader.lines().skip(start_index) {
-        buf_output.push(line?);
+      let lines = io::stdin().lock().lines();
+      if start_index > 0 {
+        for line in lines.skip(start_index) {
+          let input = line?;
+          if input.is_empty() {
+            break;
+          }
+          buf_output.push(input);
+        }
+      } else {
+        for line in lines {
+          let input = line?;
+          if input.is_empty() {
+            break;
+          }
+          buf_output.push(input);
+        }
       }
     }
   } else {
     let rule = Regex::new(&args.split)
       .map_err(|e| format!("The --split argument is not a valid regex: {}", e))
       .unwrap();
-    let mut file = File::open(args.file)?;
     let mut content = String::with_capacity(200);
-    file.read_to_string(&mut content)?;
-    let mut segs = content.split(&rule).collect::<Vec<&str>>();
+    if let Some(args_file) = args.file {
+      let mut file = File::open(args_file)?;
+      file.read_to_string(&mut content)?;
+    } else {
+      let lines = io::stdin().lock().lines();
+      for line in lines {
+        let input = line?;
+        if input.is_empty() {
+          break;
+        }
+        content.push_str(&input);
+      }
+    }
     // jump index
     if start_index > 0 {
-      segs
-        .split_off(start_index)
-        .iter()
+      rule
+        .split(&content)
+        .into_iter()
+        .skip(start_index)
         .for_each(|s| buf_output.push(s.to_string()));
     } else {
-      segs.iter().for_each(|s| buf_output.push(s.to_string()));
+      rule
+        .split(&content)
+        .into_iter()
+        .for_each(|s| buf_output.push(s.to_string()));
     }
   }
+  buf_output.end();
+
   Ok(())
 }
