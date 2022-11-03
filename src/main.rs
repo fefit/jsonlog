@@ -136,15 +136,17 @@ impl BufferedOutput {
         .map(|r| {
           if let Ok(json) = serde_json::from_str::<JsonData>(r) {
             if cond_fn(&json) {
-              return output_fn(&json);
+              return (true, output_fn(&json));
             }
           }
-          String::new()
+          (false, String::new())
         })
-        .collect::<Vec<String>>();
-      result.iter().for_each(|s| {
-        println!();
-        print!("{}", s);
+        .collect::<Vec<(bool, String)>>();
+      result.iter().for_each(|(is_ok, s)| {
+        if *is_ok {
+          println!();
+          print!("{}", s);
+        }
       });
     }
   }
@@ -168,9 +170,9 @@ impl BufferedOutput {
       if let Ok(json) = serde_json::from_str::<JsonData>(&row) {
         if cond_fn(&json) {
           print!("{}", output_fn(&json));
+          self.non_first = true;
         }
       }
-      self.non_first = true;
       if self.max_rows == 1 {
         process::exit(0);
       }

@@ -16,3 +16,6 @@ Cargo.lock
 
 # Logs
 /*.log
+
+# System
+.DS_Store
