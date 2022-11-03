@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
+use std::process;
 
 type JsonData = HashMap<String, JsonValue>;
 type BoxDynOutputFn = Box<dyn Fn(&JsonData) -> String + Send + Sync>;
@@ -17,8 +18,8 @@ type BoxDynCondFn = Box<dyn Fn(&JsonData) -> bool + Send + Sync>;
 #[command(author, version, about, long_about = None)]
 struct Args {
   /// Start index of the row number
-  #[arg(short = 'i', long, allow_negative_numbers(true))]
-  index: Option<i32>,
+  #[arg(short = 'i', long)]
+  index: Option<usize>,
 
   /// The splitter of the row, use
   #[arg(short = 's', long, default_value_t = String::from("\n"))]
@@ -37,8 +38,8 @@ struct Args {
   par: Option<usize>,
 
   /// The count of rows should be shown
-  #[arg(short = 'n', long)]
-  num: Option<usize>,
+  #[arg(short = 'n', long, default_value_t = 0)]
+  num: usize,
 
   /// The log file.
   file: Option<String>,
@@ -98,14 +99,15 @@ struct BufferedOutput {
   rows: usize,
   last_index: usize,
   non_first: bool,
+  max_rows: usize,
 }
 
 impl BufferedOutput {
   /**
    * new instance
    */
-  fn new(cap: usize, output_fn: BoxDynOutputFn, cond_fn: BoxDynCondFn) -> Self {
-    let cap = cap.min(1);
+  fn new(cap: usize, max_rows: usize, output_fn: BoxDynOutputFn, cond_fn: BoxDynCondFn) -> Self {
+    let cap = if cap == 0 { 1 } else { cap };
     BufferedOutput {
       cap,
       last_index: cap - 1,
@@ -113,23 +115,38 @@ impl BufferedOutput {
       output_fn,
       data: vec![String::new(); cap],
       rows: 0,
+      max_rows,
       non_first: false,
     }
   }
   /**
    * end
    */
-  fn end(&mut self) {
-    let cond_fn = self.cond_fn.as_mut();
-    let output_fn = &self.output_fn;
-    self.data.par_iter().for_each(|r| {
-      if let Ok(json) = serde_json::from_str::<JsonData>(r) {
-        if cond_fn(&json) {
-          println!();
-          print!("{}", output_fn(&json));
-        }
-      }
-    });
+  fn end(&mut self, is_end: bool) {
+    let rows = if is_end {
+      self.rows % self.cap
+    } else {
+      self.cap
+    };
+    if rows > 0 {
+      let cond_fn = self.cond_fn.as_mut();
+      let output_fn = &self.output_fn;
+      let result = self.data[0..rows]
+        .par_iter()
+        .map(|r| {
+          if let Ok(json) = serde_json::from_str::<JsonData>(r) {
+            if cond_fn(&json) {
+              return output_fn(&json);
+            }
+          }
+          String::new()
+        })
+        .collect::<Vec<String>>();
+      result.iter().for_each(|s| {
+        println!();
+        print!("{}", s);
+      });
+    }
   }
   /**
    * push data
@@ -139,8 +156,11 @@ impl BufferedOutput {
       let index = self.rows % self.cap;
       self.data[index] = row;
       self.rows += 1;
-      if index == self.last_index {
-        self.end();
+      if self.rows + 1 == self.max_rows {
+        self.end(true);
+        process::exit(0);
+      } else if index == self.last_index {
+        self.end(false);
       }
     } else {
       let cond_fn = &mut self.cond_fn;
@@ -151,17 +171,17 @@ impl BufferedOutput {
         }
       }
       self.non_first = true;
+      if self.max_rows == 1 {
+        process::exit(0);
+      }
     };
   }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
   let args = Args::parse();
-  let start_index = if let Some(start) = args.index {
-    0.min(start)
-  } else {
-    0
-  } as usize;
+  let start_index = args.index.unwrap_or(0);
+  let max_rows = if args.num == 0 { usize::MAX } else { args.num };
   // build the display data
   let mut output_fns: Vec<BoxDynOutputFn> = vec![];
   {
@@ -281,8 +301,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     Box::new(|_: &JsonData| true)
   };
   // buffered output
-  let mut buf_output =
-    BufferedOutput::new(args.par.unwrap_or_else(num_cpus::get), output_fn, cond_fn);
+  let mut buf_output = BufferedOutput::new(
+    args.par.unwrap_or_else(num_cpus::get),
+    max_rows,
+    output_fn,
+    cond_fn,
+  );
   // read the logs from file
   if args.split == "\n" {
     if let Some(args_file) = args.file {
@@ -341,7 +365,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .split(&content)
         .into_iter()
         .skip(start_index)
-        .for_each(|s| buf_output.push(s.to_string()));
+        .for_each(|s| {
+          buf_output.push(s.to_string());
+        });
     } else {
       rule
         .split(&content)
@@ -349,7 +375,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .for_each(|s| buf_output.push(s.to_string()));
     }
   }
-  buf_output.end();
-
+  buf_output.end(true);
   Ok(())
 }
