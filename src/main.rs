@@ -4,14 +4,64 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
-use std::error::Error;
+use std::error::Error as StdError;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::process;
+use thiserror::Error;
 
 type JsonData = HashMap<String, JsonValue>;
 type BoxDynOutputFn = Box<dyn Fn(&JsonData) -> String + Send + Sync>;
 type BoxDynCondFn = Box<dyn Fn(&JsonData) -> bool + Send + Sync>;
+
+#[derive(Error, Debug)]
+enum ArgumentError {
+  #[error("{0}")]
+  Parse(String),
+}
+
+const ESCAPE_CHARS: [(char, char); 9] = [
+  ('n', 0x0a as char),
+  ('t', 0x09 as char),
+  ('\\', '\\'),
+  ('r', 0x0d as char),
+  ('v', 0x0b as char),
+  ('f', 0x0c as char),
+  ('?', 0x3f as char),
+  ('a', 0x07 as char),
+  ('b', 0x08 as char),
+];
+
+#[inline]
+fn is_hex_char(ch: char) -> bool {
+  matches!(ch, '0'..='9' | 'a'..='f' | 'A'..='F')
+}
+
+#[inline]
+fn hex_to_char(hex_str: &str) -> char {
+  radix_str_to_char(hex_str, 16)
+}
+
+#[inline]
+fn radix_str_to_char(radix_str: &str, radix: u32) -> char {
+  let code = u32::from_str_radix(radix_str, radix).unwrap();
+  std::char::from_u32(code).unwrap()
+}
+
+fn escape_normal(ch: char) -> Option<char> {
+  for (orig, esc) in ESCAPE_CHARS {
+    if ch == orig {
+      return Some(esc);
+    }
+  }
+  None
+}
+
+#[derive(PartialEq, Eq)]
+enum EscapeRandWidth {
+  Hex,
+  Octal,
+}
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -180,7 +230,7 @@ impl BufferedOutput {
   }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn StdError>> {
   let args = Args::parse();
   let start_index = args.index.unwrap_or(0);
   let max_rows = if args.num == 0 { usize::MAX } else { args.num };
@@ -192,6 +242,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut is_expr = false;
     let mut cur_str = String::new();
     let mut iter = args.disp.chars();
+    let mut escaped: Option<EscapeRandWidth> = None;
+    let mut rand_escaped = String::new();
     // iterator over the display string
     while let Some(ch) = iter.next() {
       if is_expr {
@@ -237,33 +289,205 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         cur_str.push(ch);
       } else {
-        // not in expr
-        if ch == '{' {
-          if let Some(next_ch) = iter.next() {
-            if next_ch == '{' {
-              cur_str.push(ch);
-            } else {
-              if !cur_str.is_empty() {
-                let seg = std::mem::take(&mut cur_str);
-                output_fns.push(Box::new(move |_| seg.clone()));
+        // special escape
+        if let Some(esc) = &escaped {
+          let mut has_parsed = false;
+          let mut esc_end = false;
+          let mut radix: u32 = 16;
+          match esc {
+            EscapeRandWidth::Hex => {
+              if is_hex_char(ch) {
+                rand_escaped.push(ch);
+                has_parsed = true;
               }
-              cur_str.push(next_ch);
-              is_expr = true;
+              esc_end = true;
+            }
+            EscapeRandWidth::Octal => {
+              if matches!(ch, '0'..='7') {
+                rand_escaped.push(ch);
+                esc_end = rand_escaped.len() == 3;
+                has_parsed = true;
+              } else {
+                esc_end = true;
+              }
+              radix = 8;
             }
           }
-        } else if ch == '}' {
-          if maybe_escape {
-            maybe_escape = false;
-          } else {
-            maybe_escape = true;
+          if esc_end {
+            cur_str.push(radix_str_to_char(&rand_escaped, radix));
+            escaped = None;
+            rand_escaped = String::new();
+          }
+          if has_parsed {
+            continue;
+          }
+        }
+        // not in expr
+        match ch {
+          '{' => {
+            if let Some(next_ch) = iter.next() {
+              if next_ch == '{' {
+                cur_str.push(ch);
+              } else {
+                if !cur_str.is_empty() {
+                  let seg = std::mem::take(&mut cur_str);
+                  output_fns.push(Box::new(move |_| seg.clone()));
+                }
+                cur_str.push(next_ch);
+                is_expr = true;
+              }
+            }
+          }
+          '}' => {
+            if maybe_escape {
+              maybe_escape = false;
+            } else {
+              maybe_escape = true;
+              cur_str.push(ch);
+            }
+          }
+          '\\' => {
+            if let Some(next_ch) = iter.next() {
+              if let Some(esc) = escape_normal(next_ch) {
+                cur_str.push(esc);
+              } else {
+                match next_ch {
+                  'u' => {
+                    let first = iter
+                      .next()
+                      .expect("the --disp uses an incomplete unicode character \\u");
+                    let mut uni = String::new();
+                    if first == '{' {
+                      for hex in iter.by_ref() {
+                        if hex == '}' {
+                          break;
+                        }
+                        if is_hex_char(hex) && uni.len() < 6 {
+                          uni.push(hex);
+                        } else {
+                          return Err(Box::new(ArgumentError::Parse(format!(
+                            "the --disp use a wrong unicode character \\u{{{}{}",
+                            uni, hex
+                          ))));
+                        }
+                      }
+                    } else if is_hex_char(first) {
+                      uni.push(first);
+                      for _ in 0..3 {
+                        if let Some(hex) = iter.next() {
+                          if is_hex_char(hex) {
+                            uni.push(hex);
+                          } else {
+                            return Err(Box::new(ArgumentError::Parse(format!(
+                              "the --disp use a wrong unicode character \\u{}{}",
+                              uni, hex
+                            ))));
+                          }
+                        } else {
+                          return Err(Box::new(ArgumentError::Parse(format!(
+                            "the --disp use a wrong unicode character \\u{}",
+                            uni
+                          ))));
+                        }
+                      }
+                    } else {
+                      return Err(Box::new(ArgumentError::Parse(format!(
+                        "the --disp use a wrong unicode character \\u{}",
+                        first
+                      ))));
+                    }
+                    cur_str.push(hex_to_char(&uni));
+                  }
+                  'U' => {
+                    // c style unicode
+                    let mut uni = String::new();
+                    for _ in 0..8 {
+                      if let Some(hex) = iter.next() {
+                        if is_hex_char(hex) {
+                          uni.push(ch);
+                        } else {
+                          return Err(Box::new(ArgumentError::Parse(format!(
+                            "the --disp use a wrong unicode character \\U{}{}",
+                            uni, hex
+                          ))));
+                        }
+                      } else {
+                        return Err(Box::new(ArgumentError::Parse(format!(
+                          "the --disp use a wrong unicode character \\U{}",
+                          uni
+                        ))));
+                      }
+                    }
+                    cur_str.push(hex_to_char(&uni));
+                  }
+                  'x' => {
+                    // hex
+                    let hex = iter
+                      .next()
+                      .expect("the --disp uses an incomplete hex character \\x");
+                    if is_hex_char(hex) {
+                      escaped = Some(EscapeRandWidth::Hex);
+                      rand_escaped = String::from(hex);
+                    } else {
+                      return Err(Box::new(ArgumentError::Parse(format!(
+                        "the --disp uses a wrong hex \\x{}",
+                        hex
+                      ))));
+                    }
+                  }
+                  'c' => {
+                    // controll characters
+                    let controll = iter
+                      .next()
+                      .expect("the --disp uses an incomplete controll character \\c");
+                    let actual_ch = (match controll {
+                      '@' => 0x00,
+                      le @ ('A'..='Z') => (le as u8) - 64,
+                      '[' => 0x1B,
+                      '\\' => 0x1C,
+                      ']' => 0x1D,
+                      '^' => 0x1E,
+                      '_' => 0x1F,
+                      '?' => 0x7F,
+                      w_ch => {
+                        return Err(Box::new(ArgumentError::Parse(format!(
+                          "the --disp uses a wrong controll character \\c{}",
+                          w_ch
+                        ))));
+                      }
+                    }) as char;
+                    cur_str.push(actual_ch);
+                  }
+                  '0'..='7' => {
+                    // octal characters
+                    escaped = Some(EscapeRandWidth::Octal);
+                    rand_escaped = String::from(next_ch);
+                  }
+                  w_ch => {
+                    return Err(Box::new(ArgumentError::Parse(format!(
+                      "the --disp uses an unkown escape character \\{}",
+                      w_ch
+                    ))))
+                  }
+                }
+              }
+            }
+          }
+          _ => {
             cur_str.push(ch);
           }
-        } else {
-          cur_str.push(ch);
         }
       }
     }
     // at the end, the cur_str is not empty, should take as a string
+    if let Some(esc) = escaped {
+      let radix = if matches!(esc, EscapeRandWidth::Hex) {
+        16
+      } else {
+        8
+      };
+      cur_str.push(radix_str_to_char(&rand_escaped, radix));
+    }
     if !cur_str.is_empty() {
       output_fns.push(Box::new(move |_| cur_str.clone()));
     }
