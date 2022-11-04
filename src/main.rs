@@ -63,32 +63,32 @@ enum EscapeRandWidth {
   Octal,
 }
 
-/// Simple program to greet a person
+/// A commond line tool for parsing json data logs.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-  /// Start index of the row number
-  #[arg(short = 'i', long)]
-  index: Option<usize>,
+  /// The data starting number index
+  #[arg(short = 'i', long, default_value_t = 0)]
+  index: usize,
 
-  /// The splitter of the row, use
+  /// The data seperator
   #[arg(short = 's', long, default_value_t = String::from("\n"))]
-  split: String,
+  sep: String,
 
-  /// Format the display
+  /// Each data output display template
   #[arg(short = 'd', long)]
   disp: String,
 
-  /// Condition to filter the rows
+  /// Filter condition expression for each data
   #[arg(short = 'c', long)]
   cond: Option<String>,
 
-  /// The parallel count for output data.
+  /// Number of parallel buffered outputs
   #[arg(short = 'p', long)]
   par: Option<usize>,
 
-  /// The count of rows should be shown
-  #[arg(short = 'n', long, default_value_t = 0)]
+  /// The total number of data
+  #[arg(short = 'n', long, default_value_t = usize::MAX)]
   num: usize,
 
   /// The log file.
@@ -232,7 +232,7 @@ impl BufferedOutput {
 
 fn main() -> Result<(), Box<dyn StdError>> {
   let args = Args::parse();
-  let start_index = args.index.unwrap_or(0);
+  let start_index = args.index;
   let max_rows = if args.num == 0 { usize::MAX } else { args.num };
   // build the display data
   let mut output_fns: Vec<BoxDynOutputFn> = vec![];
@@ -534,7 +534,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     cond_fn,
   );
   // read the logs from file
-  if args.split == "\n" {
+  if args.sep == "\n" {
     if let Some(args_file) = args.file {
       let file = File::open(args_file)?;
       let reader = BufReader::new(file);
@@ -568,7 +568,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
       }
     }
   } else {
-    let rule = Regex::new(&args.split)
+    let rule = Regex::new(&args.sep)
       .map_err(|e| format!("The --split argument is not a valid regex: {}", e))
       .unwrap();
     let mut content = String::with_capacity(200);
