@@ -1,5 +1,8 @@
 use clap::Parser;
-use evalexpr::{context_map, ContextWithMutableVariables, Function, Value as EvalValue};
+use evalexpr::{
+  context_map, ContextWithMutableFunctions, ContextWithMutableVariables, Function,
+  Value as EvalValue,
+};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use serde_json::Value as JsonValue;
@@ -13,7 +16,7 @@ use thiserror::Error;
 type JsonData = HashMap<String, JsonValue>;
 type BoxDynOutputFn = Box<dyn Fn(&JsonData) -> String + Send + Sync>;
 type BoxDynCondFn = Box<dyn Fn(&JsonData) -> bool + Send + Sync>;
-
+type BoxDynError = Box<dyn StdError>;
 #[derive(Error, Debug)]
 enum ArgumentError {
   #[error("{0}")]
@@ -38,14 +41,20 @@ fn is_hex_char(ch: char) -> bool {
 }
 
 #[inline]
-fn hex_to_char(hex_str: &str) -> char {
+fn hex_to_char(hex_str: &str) -> Result<char, BoxDynError> {
   radix_str_to_char(hex_str, 16)
 }
 
 #[inline]
-fn radix_str_to_char(radix_str: &str, radix: u32) -> char {
+fn radix_str_to_char(radix_str: &str, radix: u32) -> Result<char, BoxDynError> {
   let code = u32::from_str_radix(radix_str, radix).unwrap();
-  std::char::from_u32(code).unwrap()
+  if let Some(ch) = std::char::from_u32(code) {
+    return Ok(ch);
+  }
+  Err(Box::new(ArgumentError::Parse(format!(
+    "invalid universal character \\u{}",
+    radix_str
+  ))))
 }
 
 fn escape_normal(ch: char) -> Option<char> {
@@ -230,7 +239,7 @@ impl BufferedOutput {
   }
 }
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), BoxDynError> {
   let args = Args::parse();
   let start_index = args.index;
   let max_rows = if args.num == 0 { usize::MAX } else { args.num };
@@ -256,24 +265,47 @@ fn main() -> Result<(), Box<dyn StdError>> {
           // not in quote
           if ch == '}' {
             let expr = evalexpr::build_operator_tree(&cur_str)?;
+            // get the variable identifiers
+            let var_idents = expr
+              .iter_variable_identifiers()
+              .into_iter()
+              .map(|s| s.to_string())
+              .collect::<Vec<_>>();
+            // get the function identifiers
+            let fn_idents = expr
+              .iter_function_identifiers()
+              .into_iter()
+              .map(|s| s.to_string())
+              .collect::<Vec<_>>();
             output_fns.push(Box::new(move |data: &JsonData| {
-              let mut ctx_disp = context_map! {
-                "_len_" => Function::new(|argument| {
-                  if let Ok(s) = argument.as_string() {
-                    return Ok(EvalValue::Int(s.len() as i64));
-                  }
-                  Ok(argument.clone())
-                })
+              let mut ctx_disp = evalexpr::HashMapContext::new();
+              // register variables, if not exist, registy an empty value
+              for key in &var_idents {
+                let value = if let Some(val) = data.get(key) {
+                  ProxyValue::from(val).into()
+                } else {
+                  EvalValue::Empty
+                };
+                ctx_disp.set_value(key.into(), value).unwrap();
               }
-              .unwrap();
-              for (key, value) in data.iter() {
+              let keys = data.keys().cloned().collect::<Vec<_>>();
+              if fn_idents.contains(&String::from("has_key")) {
                 ctx_disp
-                  .set_value(key.into(), ProxyValue::from(value).into())
+                  .set_function(
+                    "has_key".into(),
+                    Function::new(move |argument| {
+                      if let Ok(k) = argument.as_string() {
+                        return Ok(EvalValue::Boolean(keys.contains(&k)));
+                      }
+                      Ok(EvalValue::Boolean(false))
+                    }),
+                  )
                   .unwrap();
               }
               if let Ok(value) = expr.eval_with_context(&ctx_disp) {
                 match value {
                   EvalValue::String(s) => s,
+                  EvalValue::Empty => String::new(),
                   v => format!("{}", v),
                 }
               } else {
@@ -314,7 +346,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
             }
           }
           if esc_end {
-            cur_str.push(radix_str_to_char(&rand_escaped, radix));
+            cur_str.push(radix_str_to_char(&rand_escaped, radix)?);
             escaped = None;
             rand_escaped = String::new();
           }
@@ -396,7 +428,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
                         first
                       ))));
                     }
-                    cur_str.push(hex_to_char(&uni));
+                    cur_str.push(hex_to_char(&uni)?);
                   }
                   'U' => {
                     // c style unicode
@@ -418,7 +450,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
                         ))));
                       }
                     }
-                    cur_str.push(hex_to_char(&uni));
+                    cur_str.push(hex_to_char(&uni)?);
                   }
                   'x' => {
                     // hex
@@ -486,7 +518,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
       } else {
         8
       };
-      cur_str.push(radix_str_to_char(&rand_escaped, radix));
+      cur_str.push(radix_str_to_char(&rand_escaped, radix)?);
     }
     if !cur_str.is_empty() {
       output_fns.push(Box::new(move |_| cur_str.clone()));
@@ -506,20 +538,25 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let expr = evalexpr::build_operator_tree(&cond)
       .map_err(|e| format!("The --cond argument uses an unsupported expression:{}", e))?;
     Box::new(move |data: &JsonData| {
-      let mut ctx_cond = context_map! {
-        "_len_" => Function::new(|argument| {
-          if let Ok(s) = argument.as_string() {
-            return Ok(EvalValue::Int(s.len() as i64));
-          }
-          Ok(EvalValue::Int(0))
-        })
-      }
-      .unwrap();
+      let mut ctx_cond = evalexpr::HashMapContext::new();
+      let mut keys: Vec<String> = vec![];
       for (key, value) in data.iter() {
         ctx_cond
           .set_value(key.into(), ProxyValue::from(value).into())
           .unwrap_or(());
+        keys.push(key.clone());
       }
+      ctx_cond
+        .set_function(
+          "has_key".into(),
+          Function::new(move |argument| {
+            if let Ok(k) = argument.as_string() {
+              return Ok(EvalValue::Boolean(keys.contains(&k)));
+            }
+            Ok(EvalValue::Boolean(false))
+          }),
+        )
+        .unwrap();
       let bool_cond = expr.eval_boolean_with_context(&ctx_cond);
       bool_cond.unwrap_or(false)
     })
