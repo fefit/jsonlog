@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::process;
 use std::str::Chars;
 use thiserror::Error;
@@ -353,8 +353,20 @@ fn gen_output_fn(tmpl: &str, arg_name: &str) -> GenResult<(bool, BoxDynOutputFn)
                 .set_function(
                   EXP_DATA_HAS_KEY.into(),
                   Function::new(move |argument| {
-                    if let Ok(k) = argument.as_string() {
-                      return Ok(EvalValue::Boolean(keys.contains(&k)));
+                    if let Ok(key) = argument.as_string() {
+                      return Ok(EvalValue::Boolean(keys.contains(&key)));
+                    } else if let Ok(find_keys) = argument.as_tuple() {
+                      if !find_keys.is_empty() {
+                        for value in find_keys {
+                          if let Ok(key) = value.as_string() {
+                            if keys.contains(&key) {
+                              continue;
+                            }
+                          }
+                          return Ok(EvalValue::Boolean(false));
+                        }
+                        return Ok(EvalValue::Boolean(true));
+                      }
                     }
                     Ok(EvalValue::Boolean(false))
                   }),
@@ -457,7 +469,7 @@ fn unique_idents_rm_datarow(idents: &mut Vec<String>) -> bool {
 }
 
 /**
- *
+ * function string::find
  */
 fn is_equal_chars(a: &[char], b: &[char]) -> bool {
   let total = a.len();
@@ -586,7 +598,7 @@ impl From<&JsonValue> for ProxyValue {
       }
       JsonValue::Null => ProxyValue::Null,
       JsonValue::String(s) => ProxyValue::String(s.clone()),
-      v => ProxyValue::Unexpected(format!("{:?}", v)),
+      v => ProxyValue::Unexpected(format!("{}", v)),
     }
   }
 }
@@ -799,6 +811,64 @@ impl BufferedOutput {
   }
 }
 
+struct BufferedInput {
+  non_first: bool,
+  start_row: usize,
+  sep_max_len: usize,
+  prev_index: usize,
+  pushed_row: usize,
+  last_content: String,
+  rule: Regex,
+}
+
+impl BufferedInput {
+  fn push(&mut self, output: &mut BufferedOutput, row: String) {
+    if self.non_first {
+      self.last_content.push('\n');
+    } else {
+      self.non_first = true;
+    }
+    self.last_content.push_str(&row);
+    let last_content = self.last_content.as_str();
+    let prev_index = self.prev_index;
+    let mut end_index = 0;
+    for mat in self.rule.find_iter(&last_content[prev_index..]) {
+      let cur_start_index = mat.start() + prev_index;
+      if self.pushed_row == self.start_row {
+        output.push(last_content[end_index..cur_start_index].to_string())
+      } else {
+        self.pushed_row += 1;
+      }
+      end_index = mat.end() + prev_index;
+    }
+    if end_index > 0 {
+      // found matched items
+      if end_index < last_content.len() {
+        self.last_content = self.last_content.split_off(end_index);
+      } else {
+        self.last_content.clear();
+      }
+      self.prev_index = 0;
+    } else {
+      // no matched found, set prev index to jump some searched characters
+      let mut prev_index = last_content.len() - self.sep_max_len;
+      while prev_index > 0 {
+        if str::is_char_boundary(last_content, prev_index) {
+          self.prev_index = prev_index;
+          break;
+        }
+        prev_index -= 1;
+      }
+    }
+  }
+
+  fn end(&mut self, output: &mut BufferedOutput) {
+    if self.pushed_row == self.start_row && !self.last_content.is_empty() {
+      output.push(self.last_content.to_string());
+    }
+  }
+}
+
 fn main() -> GenResult {
   // args
   let args = Args::parse();
@@ -843,8 +913,20 @@ fn main() -> GenResult {
           .set_function(
             EXP_DATA_HAS_KEY.into(),
             Function::new(move |argument| {
-              if let Ok(k) = argument.as_string() {
-                return Ok(EvalValue::Boolean(keys.contains(&k)));
+              if let Ok(key) = argument.as_string() {
+                return Ok(EvalValue::Boolean(keys.contains(&key)));
+              } else if let Ok(find_keys) = argument.as_tuple() {
+                if !find_keys.is_empty() {
+                  for value in find_keys {
+                    if let Ok(key) = value.as_string() {
+                      if keys.contains(&key) {
+                        continue;
+                      }
+                    }
+                    return Ok(EvalValue::Boolean(false));
+                  }
+                  return Ok(EvalValue::Boolean(true));
+                }
               }
               Ok(EvalValue::Boolean(false))
             }),
@@ -962,13 +1044,24 @@ fn main() -> GenResult {
       }
     }
   } else {
-    let rule = Regex::new(&args.sep)
+    let rule = Regex::new(&(String::from("(?m)") + &args.sep))
       .map_err(|e| format!("The --split argument is not a valid regex: {}", e))
       .unwrap();
-    let mut content = String::with_capacity(200);
+    let mut buf_input = BufferedInput {
+      non_first: false,
+      start_row: start_index,
+      pushed_row: 0,
+      prev_index: 0,
+      sep_max_len: 10,
+      last_content: String::with_capacity(100),
+      rule,
+    };
     if let Some(args_file) = args.file {
-      let mut file = File::open(args_file)?;
-      file.read_to_string(&mut content)?;
+      let file = File::open(args_file)?;
+      let reader = BufReader::new(file);
+      for line in reader.lines() {
+        buf_input.push(&mut buf_output, line?);
+      }
     } else {
       let lines = io::stdin().lock().lines();
       for line in lines {
@@ -976,24 +1069,10 @@ fn main() -> GenResult {
         if input.is_empty() {
           break;
         }
-        content.push_str(&input);
+        buf_input.push(&mut buf_output, input);
       }
     }
-    // jump index
-    if start_index > 0 {
-      rule
-        .split(&content)
-        .into_iter()
-        .skip(start_index)
-        .for_each(|s| {
-          buf_output.push(s.to_string());
-        });
-    } else {
-      rule
-        .split(&content)
-        .into_iter()
-        .for_each(|s| buf_output.push(s.to_string()));
-    }
+    buf_input.end(&mut buf_output);
   }
   buf_output.end(true);
   Ok(())
