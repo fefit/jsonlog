@@ -1,7 +1,6 @@
 use clap::Parser;
 use evalexpr::{
-  context_map, ContextWithMutableFunctions, ContextWithMutableVariables, Function,
-  Value as EvalValue,
+  ContextWithMutableFunctions, ContextWithMutableVariables, Function, Value as EvalValue,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
@@ -11,6 +10,7 @@ use std::error::Error as StdError;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
 use std::process;
+use std::str::Chars;
 use thiserror::Error;
 
 type JsonData = HashMap<String, JsonValue>;
@@ -66,6 +66,222 @@ fn escape_normal(ch: char) -> Option<char> {
   None
 }
 
+/**
+ *
+ */
+fn parse_maybe_still_in_escape(
+  cur_str: &mut String,
+  ch: char,
+  escape_data: &mut EscapeData,
+) -> Result<bool, BoxDynError> {
+  if let Some(esc) = &escape_data.escaped {
+    let mut has_parsed = false;
+    let (esc_end, radix) = match esc {
+      EscapeRandWidth::Hex => {
+        if is_hex_char(ch) {
+          escape_data.rand_escaped.push(ch);
+          has_parsed = true;
+        }
+        (true, 16)
+      }
+      EscapeRandWidth::Octal => {
+        let esc_end = if matches!(ch, '0'..='7') {
+          escape_data.rand_escaped.push(ch);
+          has_parsed = true;
+          escape_data.rand_escaped.len() == 3
+        } else {
+          true
+        };
+        (esc_end, 8)
+      }
+    };
+    if esc_end {
+      cur_str.push(radix_str_to_char(&escape_data.rand_escaped, radix)?);
+      escape_data.escaped = None;
+      escape_data.rand_escaped = String::new();
+    }
+    return Ok(has_parsed);
+  }
+  Ok(false)
+}
+
+/**
+ * parse in escape characters
+ */
+fn parse_in_escape(
+  cur_str: &mut String,
+  ch: char,
+  escape_data: &mut EscapeData,
+  iter: &mut Chars,
+  arg_name: &str,
+) -> Result<(), BoxDynError> {
+  if let Some(next_ch) = iter.next() {
+    if let Some(esc) = escape_normal(next_ch) {
+      cur_str.push(esc);
+    } else {
+      match next_ch {
+        'u' => {
+          let first = iter
+            .next()
+            .unwrap_or_else(|| panic!("the {} uses an incomplete unicode character \\u", arg_name));
+          let mut uni = String::new();
+          if first == '{' {
+            for hex in iter.by_ref() {
+              if hex == '}' {
+                break;
+              }
+              if is_hex_char(hex) && uni.len() < 6 {
+                uni.push(hex);
+              } else {
+                return Err(Box::new(ArgumentError::Parse(format!(
+                  "the {} use a wrong unicode character \\u{{{}{}",
+                  arg_name, uni, hex
+                ))));
+              }
+            }
+          } else if is_hex_char(first) {
+            uni.push(first);
+            for _ in 0..3 {
+              if let Some(hex) = iter.next() {
+                if is_hex_char(hex) {
+                  uni.push(hex);
+                } else {
+                  return Err(Box::new(ArgumentError::Parse(format!(
+                    "the {} use a wrong unicode character \\u{}{}",
+                    arg_name, uni, hex
+                  ))));
+                }
+              } else {
+                return Err(Box::new(ArgumentError::Parse(format!(
+                  "the {} use a wrong unicode character \\u{}",
+                  arg_name, uni
+                ))));
+              }
+            }
+          } else {
+            return Err(Box::new(ArgumentError::Parse(format!(
+              "the {} use a wrong unicode character \\u{}",
+              arg_name, first
+            ))));
+          }
+          cur_str.push(hex_to_char(&uni)?);
+        }
+        'U' => {
+          // c style unicode
+          let mut uni = String::new();
+          for _ in 0..8 {
+            if let Some(hex) = iter.next() {
+              if is_hex_char(hex) {
+                uni.push(ch);
+              } else {
+                return Err(Box::new(ArgumentError::Parse(format!(
+                  "the {} use a wrong unicode character \\U{}{}",
+                  arg_name, uni, hex
+                ))));
+              }
+            } else {
+              return Err(Box::new(ArgumentError::Parse(format!(
+                "the {} use a wrong unicode character \\U{}",
+                arg_name, uni
+              ))));
+            }
+          }
+          cur_str.push(hex_to_char(&uni)?);
+        }
+        'x' => {
+          // hex
+          let hex = iter
+            .next()
+            .unwrap_or_else(|| panic!("the {} uses an incomplete hex character \\x", arg_name));
+          if is_hex_char(hex) {
+            escape_data.escaped = Some(EscapeRandWidth::Hex);
+            escape_data.rand_escaped = String::from(hex);
+          } else {
+            return Err(Box::new(ArgumentError::Parse(format!(
+              "the {} uses a wrong hex \\x{}",
+              arg_name, hex
+            ))));
+          }
+        }
+        'c' => {
+          // controll characters
+          let controll = iter.next().unwrap_or_else(|| {
+            panic!("the {} uses an incomplete controll character \\c", arg_name)
+          });
+          let actual_ch = (match controll {
+            '@' => 0x00,
+            le @ ('A'..='Z') => (le as u8) - 64,
+            '[' => 0x1B,
+            '\\' => 0x1C,
+            ']' => 0x1D,
+            '^' => 0x1E,
+            '_' => 0x1F,
+            '?' => 0x7F,
+            w_ch => {
+              return Err(Box::new(ArgumentError::Parse(format!(
+                "the {} uses a wrong controll character \\c{}",
+                arg_name, w_ch
+              ))));
+            }
+          }) as char;
+          cur_str.push(actual_ch);
+        }
+        '0'..='7' => {
+          // octal characters
+          escape_data.escaped = Some(EscapeRandWidth::Octal);
+          escape_data.rand_escaped = String::from(next_ch);
+        }
+        w_ch => {
+          return Err(Box::new(ArgumentError::Parse(format!(
+            "the {} uses an unkown escape character \\{}",
+            arg_name, w_ch
+          ))))
+        }
+      }
+    }
+  }
+  Ok(())
+}
+
+fn parse_in_escape_end(
+  cur_str: &mut String,
+  escape_data: &mut EscapeData,
+) -> Result<(), BoxDynError> {
+  if let Some(esc) = &escape_data.escaped {
+    let radix = if matches!(esc, EscapeRandWidth::Hex) {
+      16
+    } else {
+      8
+    };
+    cur_str.push(radix_str_to_char(&escape_data.rand_escaped, radix)?);
+  }
+  Ok(())
+}
+
+fn parse_escape_output(content: &str, arg_name: &str) -> Result<String, BoxDynError> {
+  let mut cur_str = String::with_capacity(10);
+  let mut escape_data = EscapeData::default();
+  let mut iter = content.chars();
+  while let Some(ch) = iter.next() {
+    if parse_maybe_still_in_escape(&mut cur_str, ch, &mut escape_data)? {
+      continue;
+    }
+    if ch == '\\' {
+      parse_in_escape(&mut cur_str, ch, &mut escape_data, &mut iter, arg_name)?;
+    } else {
+      cur_str.push(ch);
+    }
+  }
+  parse_in_escape_end(&mut cur_str, &mut escape_data)?;
+  Ok(cur_str)
+}
+
+#[derive(Default)]
+struct EscapeData {
+  escaped: Option<EscapeRandWidth>,
+  rand_escaped: String,
+}
+
 #[derive(PartialEq, Eq)]
 enum EscapeRandWidth {
   Hex,
@@ -83,6 +299,10 @@ struct Args {
   /// The data seperator
   #[arg(short = 's', long, default_value_t = String::from("\n"))]
   sep: String,
+
+  /// The output data seperator
+  #[arg(short = 'j', long)]
+  out_sep: Option<String>,
 
   /// Each data output display template
   #[arg(short = 'd', long)]
@@ -104,10 +324,16 @@ struct Args {
   file: Option<String>,
 }
 
+struct BufferedOutputConfig {
+  max_rows: usize,
+  cap: usize,
+  out_sep: String,
+}
+
 /**
  * Proxy value
  */
-pub enum ProxyValue {
+enum ProxyValue {
   Bool(bool),
   Float(f64),
   Int(i64),
@@ -153,28 +379,31 @@ impl From<ProxyValue> for EvalValue {
 struct BufferedOutput {
   output_fn: BoxDynOutputFn,
   cond_fn: BoxDynCondFn,
-  cap: usize,
   data: Vec<String>,
   rows: usize,
   last_index: usize,
   non_first: bool,
-  max_rows: usize,
+  config: BufferedOutputConfig,
 }
 
 impl BufferedOutput {
   /**
    * new instance
    */
-  fn new(cap: usize, max_rows: usize, output_fn: BoxDynOutputFn, cond_fn: BoxDynCondFn) -> Self {
-    let cap = if cap == 0 { 1 } else { cap };
+  fn new(
+    mut config: BufferedOutputConfig,
+    output_fn: BoxDynOutputFn,
+    cond_fn: BoxDynCondFn,
+  ) -> Self {
+    let cap = if config.cap == 0 { 1 } else { config.cap };
+    config.cap = cap;
     BufferedOutput {
-      cap,
+      config,
       last_index: cap - 1,
       cond_fn,
       output_fn,
       data: vec![String::new(); cap],
       rows: 0,
-      max_rows,
       non_first: false,
     }
   }
@@ -182,29 +411,16 @@ impl BufferedOutput {
    * end
    */
   fn end(&mut self, is_end: bool) {
-    let rows = if is_end {
-      self.rows % self.cap
-    } else {
-      self.cap
-    };
+    let cap = self.config.cap;
+    let rows = if is_end { self.rows % cap } else { cap };
     if rows > 0 {
       let cond_fn = self.cond_fn.as_mut();
       let output_fn = &self.output_fn;
-      let result = self.data[0..rows]
-        .par_iter()
-        .map(|r| {
-          if let Ok(json) = serde_json::from_str::<JsonData>(r) {
-            if cond_fn(&json) {
-              return (true, output_fn(&json));
-            }
+      self.data[0..rows].par_iter().for_each(|r| {
+        if let Ok(json) = serde_json::from_str::<JsonData>(r) {
+          if cond_fn(&json) {
+            print!("{}{}", self.config.out_sep, output_fn(&json));
           }
-          (false, String::new())
-        })
-        .collect::<Vec<(bool, String)>>();
-      result.iter().for_each(|(is_ok, s)| {
-        if *is_ok {
-          println!();
-          print!("{}", s);
         }
       });
     }
@@ -214,10 +430,10 @@ impl BufferedOutput {
    */
   fn push(&mut self, row: String) {
     if self.non_first {
-      let index = self.rows % self.cap;
+      let index = self.rows % self.config.cap;
       self.data[index] = row;
       self.rows += 1;
-      if self.rows + 1 == self.max_rows {
+      if self.rows + 1 == self.config.max_rows {
         self.end(true);
         process::exit(0);
       } else if index == self.last_index {
@@ -232,7 +448,7 @@ impl BufferedOutput {
           self.non_first = true;
         }
       }
-      if self.max_rows == 1 {
+      if self.config.max_rows == 1 {
         process::exit(0);
       }
     };
@@ -243,16 +459,21 @@ fn main() -> Result<(), BoxDynError> {
   let args = Args::parse();
   let start_index = args.index;
   let max_rows = if args.num == 0 { usize::MAX } else { args.num };
+  let out_sep = if let Some(out_sep) = args.out_sep {
+    parse_escape_output(&out_sep, "--out-sep")?
+  } else {
+    String::from("\n")
+  };
   // build the display data
   let mut output_fns: Vec<BoxDynOutputFn> = vec![];
   {
+    let arg_name = "--disp";
     let mut quote_char = '\0';
     let mut maybe_escape = false;
     let mut is_expr = false;
     let mut cur_str = String::new();
     let mut iter = args.disp.chars();
-    let mut escaped: Option<EscapeRandWidth> = None;
-    let mut rand_escaped = String::new();
+    let mut escape_data = EscapeData::default();
     // iterator over the display string
     while let Some(ch) = iter.next() {
       if is_expr {
@@ -288,11 +509,11 @@ fn main() -> Result<(), BoxDynError> {
                 };
                 ctx_disp.set_value(key.into(), value).unwrap();
               }
-              let keys = data.keys().cloned().collect::<Vec<_>>();
-              if fn_idents.contains(&String::from("has_key")) {
+              if fn_idents.contains(&String::from("data::has_key")) {
+                let keys = data.keys().cloned().collect::<Vec<_>>();
                 ctx_disp
                   .set_function(
-                    "has_key".into(),
+                    "data::has_key".into(),
                     Function::new(move |argument| {
                       if let Ok(k) = argument.as_string() {
                         return Ok(EvalValue::Boolean(keys.contains(&k)));
@@ -322,37 +543,8 @@ fn main() -> Result<(), BoxDynError> {
         cur_str.push(ch);
       } else {
         // special escape
-        if let Some(esc) = &escaped {
-          let mut has_parsed = false;
-          let mut esc_end = false;
-          let mut radix: u32 = 16;
-          match esc {
-            EscapeRandWidth::Hex => {
-              if is_hex_char(ch) {
-                rand_escaped.push(ch);
-                has_parsed = true;
-              }
-              esc_end = true;
-            }
-            EscapeRandWidth::Octal => {
-              if matches!(ch, '0'..='7') {
-                rand_escaped.push(ch);
-                esc_end = rand_escaped.len() == 3;
-                has_parsed = true;
-              } else {
-                esc_end = true;
-              }
-              radix = 8;
-            }
-          }
-          if esc_end {
-            cur_str.push(radix_str_to_char(&rand_escaped, radix)?);
-            escaped = None;
-            rand_escaped = String::new();
-          }
-          if has_parsed {
-            continue;
-          }
+        if parse_maybe_still_in_escape(&mut cur_str, ch, &mut escape_data)? {
+          continue;
         }
         // not in expr
         match ch {
@@ -379,131 +571,7 @@ fn main() -> Result<(), BoxDynError> {
             }
           }
           '\\' => {
-            if let Some(next_ch) = iter.next() {
-              if let Some(esc) = escape_normal(next_ch) {
-                cur_str.push(esc);
-              } else {
-                match next_ch {
-                  'u' => {
-                    let first = iter
-                      .next()
-                      .expect("the --disp uses an incomplete unicode character \\u");
-                    let mut uni = String::new();
-                    if first == '{' {
-                      for hex in iter.by_ref() {
-                        if hex == '}' {
-                          break;
-                        }
-                        if is_hex_char(hex) && uni.len() < 6 {
-                          uni.push(hex);
-                        } else {
-                          return Err(Box::new(ArgumentError::Parse(format!(
-                            "the --disp use a wrong unicode character \\u{{{}{}",
-                            uni, hex
-                          ))));
-                        }
-                      }
-                    } else if is_hex_char(first) {
-                      uni.push(first);
-                      for _ in 0..3 {
-                        if let Some(hex) = iter.next() {
-                          if is_hex_char(hex) {
-                            uni.push(hex);
-                          } else {
-                            return Err(Box::new(ArgumentError::Parse(format!(
-                              "the --disp use a wrong unicode character \\u{}{}",
-                              uni, hex
-                            ))));
-                          }
-                        } else {
-                          return Err(Box::new(ArgumentError::Parse(format!(
-                            "the --disp use a wrong unicode character \\u{}",
-                            uni
-                          ))));
-                        }
-                      }
-                    } else {
-                      return Err(Box::new(ArgumentError::Parse(format!(
-                        "the --disp use a wrong unicode character \\u{}",
-                        first
-                      ))));
-                    }
-                    cur_str.push(hex_to_char(&uni)?);
-                  }
-                  'U' => {
-                    // c style unicode
-                    let mut uni = String::new();
-                    for _ in 0..8 {
-                      if let Some(hex) = iter.next() {
-                        if is_hex_char(hex) {
-                          uni.push(ch);
-                        } else {
-                          return Err(Box::new(ArgumentError::Parse(format!(
-                            "the --disp use a wrong unicode character \\U{}{}",
-                            uni, hex
-                          ))));
-                        }
-                      } else {
-                        return Err(Box::new(ArgumentError::Parse(format!(
-                          "the --disp use a wrong unicode character \\U{}",
-                          uni
-                        ))));
-                      }
-                    }
-                    cur_str.push(hex_to_char(&uni)?);
-                  }
-                  'x' => {
-                    // hex
-                    let hex = iter
-                      .next()
-                      .expect("the --disp uses an incomplete hex character \\x");
-                    if is_hex_char(hex) {
-                      escaped = Some(EscapeRandWidth::Hex);
-                      rand_escaped = String::from(hex);
-                    } else {
-                      return Err(Box::new(ArgumentError::Parse(format!(
-                        "the --disp uses a wrong hex \\x{}",
-                        hex
-                      ))));
-                    }
-                  }
-                  'c' => {
-                    // controll characters
-                    let controll = iter
-                      .next()
-                      .expect("the --disp uses an incomplete controll character \\c");
-                    let actual_ch = (match controll {
-                      '@' => 0x00,
-                      le @ ('A'..='Z') => (le as u8) - 64,
-                      '[' => 0x1B,
-                      '\\' => 0x1C,
-                      ']' => 0x1D,
-                      '^' => 0x1E,
-                      '_' => 0x1F,
-                      '?' => 0x7F,
-                      w_ch => {
-                        return Err(Box::new(ArgumentError::Parse(format!(
-                          "the --disp uses a wrong controll character \\c{}",
-                          w_ch
-                        ))));
-                      }
-                    }) as char;
-                    cur_str.push(actual_ch);
-                  }
-                  '0'..='7' => {
-                    // octal characters
-                    escaped = Some(EscapeRandWidth::Octal);
-                    rand_escaped = String::from(next_ch);
-                  }
-                  w_ch => {
-                    return Err(Box::new(ArgumentError::Parse(format!(
-                      "the --disp uses an unkown escape character \\{}",
-                      w_ch
-                    ))))
-                  }
-                }
-              }
-            }
+            parse_in_escape(&mut cur_str, ch, &mut escape_data, &mut iter, arg_name)?;
           }
           _ => {
             cur_str.push(ch);
@@ -512,14 +580,7 @@ fn main() -> Result<(), BoxDynError> {
       }
     }
     // at the end, the cur_str is not empty, should take as a string
-    if let Some(esc) = escaped {
-      let radix = if matches!(esc, EscapeRandWidth::Hex) {
-        16
-      } else {
-        8
-      };
-      cur_str.push(radix_str_to_char(&rand_escaped, radix)?);
-    }
+    parse_in_escape_end(&mut cur_str, &mut escape_data)?;
     if !cur_str.is_empty() {
       output_fns.push(Box::new(move |_| cur_str.clone()));
     }
@@ -537,26 +598,42 @@ fn main() -> Result<(), BoxDynError> {
   let cond_fn: BoxDynCondFn = if let Some(cond) = args.cond {
     let expr = evalexpr::build_operator_tree(&cond)
       .map_err(|e| format!("The --cond argument uses an unsupported expression:{}", e))?;
+    // get the variable identifiers
+    let var_idents = expr
+      .iter_variable_identifiers()
+      .into_iter()
+      .map(|s| s.to_string())
+      .collect::<Vec<_>>();
+    // get the function identifiers
+    let fn_idents = expr
+      .iter_function_identifiers()
+      .into_iter()
+      .map(|s| s.to_string())
+      .collect::<Vec<_>>();
     Box::new(move |data: &JsonData| {
       let mut ctx_cond = evalexpr::HashMapContext::new();
-      let mut keys: Vec<String> = vec![];
-      for (key, value) in data.iter() {
-        ctx_cond
-          .set_value(key.into(), ProxyValue::from(value).into())
-          .unwrap_or(());
-        keys.push(key.clone());
+      for key in &var_idents {
+        let value = if let Some(val) = data.get(key) {
+          ProxyValue::from(val).into()
+        } else {
+          EvalValue::Empty
+        };
+        ctx_cond.set_value(key.into(), value).unwrap();
       }
-      ctx_cond
-        .set_function(
-          "has_key".into(),
-          Function::new(move |argument| {
-            if let Ok(k) = argument.as_string() {
-              return Ok(EvalValue::Boolean(keys.contains(&k)));
-            }
-            Ok(EvalValue::Boolean(false))
-          }),
-        )
-        .unwrap();
+      if fn_idents.contains(&String::from("data::has_key")) {
+        let keys = data.keys().cloned().collect::<Vec<_>>();
+        ctx_cond
+          .set_function(
+            "data::has_key".into(),
+            Function::new(move |argument| {
+              if let Ok(k) = argument.as_string() {
+                return Ok(EvalValue::Boolean(keys.contains(&k)));
+              }
+              Ok(EvalValue::Boolean(false))
+            }),
+          )
+          .unwrap();
+      }
       let bool_cond = expr.eval_boolean_with_context(&ctx_cond);
       bool_cond.unwrap_or(false)
     })
@@ -565,8 +642,11 @@ fn main() -> Result<(), BoxDynError> {
   };
   // buffered output
   let mut buf_output = BufferedOutput::new(
-    args.par.unwrap_or_else(num_cpus::get),
-    max_rows,
+    BufferedOutputConfig {
+      max_rows,
+      cap: args.par.unwrap_or_else(num_cpus::get),
+      out_sep,
+    },
     output_fn,
     cond_fn,
   );
