@@ -5,7 +5,7 @@ use evalexpr::{
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use regex::Regex;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -22,6 +22,8 @@ type GenResult<T = ()> = Result<T, BoxDynError>;
 
 const EXP_DATA_HAS_KEY: &str = "data::has_key";
 const EXP_DATA_ROW: &str = "data::row";
+const EXP_DATA_ERROR: &str = "data::error";
+const EXP_STRING_FIND: &str = "string::find";
 
 #[derive(Error, Debug)]
 enum ArgumentError {
@@ -313,7 +315,7 @@ fn gen_output_fn(tmpl: &str, arg_name: &str) -> GenResult<(bool, BoxDynOutputFn)
         if ch == '}' {
           let expr = evalexpr::build_operator_tree(&cur_str)?;
           // get the variable identifiers
-          let var_idents = expr
+          let mut var_idents = expr
             .iter_variable_identifiers()
             .into_iter()
             .map(|s| s.to_string())
@@ -325,7 +327,7 @@ fn gen_output_fn(tmpl: &str, arg_name: &str) -> GenResult<(bool, BoxDynOutputFn)
             .map(|s| s.to_string())
             .collect::<Vec<_>>();
           // check if has data row variable
-          let has_row = var_idents.contains(&String::from(EXP_DATA_ROW));
+          let has_row = unique_idents_rm_datarow(&mut var_idents);
           // set whether use row
           use_row = use_row || has_row;
           // put output segments
@@ -434,6 +436,76 @@ fn gen_output_fn(tmpl: &str, arg_name: &str) -> GenResult<(bool, BoxDynOutputFn)
   ))
 }
 
+/**
+ * unique identifiers
+ */
+fn unique_idents(idents: &mut Vec<String>) {
+  let mut sets: HashSet<String> = HashSet::new();
+  idents.retain(|s| sets.insert(s.clone()));
+}
+
+/**
+ * unique identifiers and remove the data::row if exist
+ */
+fn unique_idents_rm_datarow(idents: &mut Vec<String>) -> bool {
+  unique_idents(idents);
+  if let Some(index) = idents.iter().position(|name| name == EXP_DATA_ROW) {
+    idents.remove(index);
+    return true;
+  }
+  false
+}
+
+/**
+ *
+ */
+fn is_equal_chars(a: &[char], b: &[char]) -> bool {
+  let total = a.len();
+  let mut start_index = 0;
+  let mut end_index = total - 1;
+  while start_index < end_index {
+    if a[start_index] == b[start_index] && a[end_index] == b[end_index] {
+      start_index += 1;
+      end_index -= 1;
+    } else {
+      return false;
+    }
+  }
+  if total % 2 == 1 {
+    a[start_index] == b[start_index]
+  } else {
+    true
+  }
+}
+
+fn string_find(haystack: &str, search: &str, start_index: i64) -> i64 {
+  let h_chars = haystack.chars().collect::<Vec<char>>();
+  let h_len = h_chars.len();
+  let s_chars = search.chars().collect::<Vec<char>>();
+  let s_len = s_chars.len();
+  if h_len < s_len {
+    return -1;
+  }
+  let b_index = if start_index < 0 {
+    if h_len as i64 > -start_index {
+      (h_len as i64 + start_index) as usize
+    } else {
+      0
+    }
+  } else {
+    start_index as usize
+  };
+  let e_index = h_len - s_len;
+  if e_index >= b_index {
+    for index in b_index..=e_index {
+      if is_equal_chars(&h_chars[index..index + s_len], &s_chars) {
+        return index as i64;
+      }
+    }
+  }
+  -1
+}
+
 #[derive(Default)]
 struct EscapeData {
   escaped: Option<EscapeRandWidth>,
@@ -462,17 +534,21 @@ struct Args {
   #[arg(short = 'j', long)]
   out_sep: Option<String>,
 
-  /// Each data output display template
+  /// Each json data output display template
   #[arg(short = 'd', long)]
   disp: Option<String>,
 
-  ///
+  /// Each error json data ouput display template
   #[arg(short = 'e', long)]
   err_disp: Option<String>,
 
-  /// Filter condition expression for each data
+  /// Filter condition expression for data item
   #[arg(short = 'c', long)]
   cond: Option<String>,
+
+  /// Off condition expression for error data item
+  #[arg(short = 'o', long)]
+  off_cond_err: bool,
 
   /// Number of parallel buffered outputs
   #[arg(short = 'p', long)]
@@ -539,11 +615,13 @@ struct BufferedOutputConfig {
   show_disp: bool,
   show_err_disp: bool,
   no_use_row: bool,
+  off_err_cond: bool,
 }
 
 struct BufferedOutput {
   non_first: bool,
   rows: usize,
+  index: usize,
   last_index: usize,
   data: Vec<String>,
   config: BufferedOutputConfig,
@@ -566,7 +644,7 @@ impl BufferedOutput {
     let cap = if config.cap == 0 { 1 } else { config.cap };
     let print_fn = if config.no_use_row {
       Box::new(|this: &BufferedOutput, rows: usize| {
-        let row_no = this.rows + 2;
+        let row_no = this.rows - rows + 1;
         let cond_fn = &this.cond_fn;
         let output_fn = &this.output_fn;
         let err_output_fn = &this.err_output_fn;
@@ -584,13 +662,20 @@ impl BufferedOutput {
             } else if this.config.show_err_disp {
               let mut json = HashMap::new();
               json.insert(
-                String::from("data::error"),
+                String::from(EXP_DATA_ERROR),
                 JsonValue::String(maybe_json.err().unwrap().to_string()),
               );
-              return (
-                true,
-                format!("{}{}", this.config.out_sep, err_output_fn(&json, row_no)),
-              );
+              let is_ok = if this.config.off_err_cond {
+                true
+              } else {
+                cond_fn(&json, row_no)
+              };
+              if is_ok {
+                return (
+                  true,
+                  format!("{}{}", this.config.out_sep, err_output_fn(&json, row_no)),
+                );
+              }
             }
             (false, String::new())
           })
@@ -603,7 +688,7 @@ impl BufferedOutput {
       })
     } else {
       Box::new(|this: &BufferedOutput, rows| {
-        let row_no = this.rows + 2;
+        let row_no = this.rows - rows + 1;
         let cond_fn = &this.cond_fn;
         let output_fn = &this.output_fn;
         let err_output_fn = &this.err_output_fn;
@@ -621,20 +706,28 @@ impl BufferedOutput {
           } else if this.config.show_err_disp {
             let mut json = HashMap::new();
             json.insert(
-              String::from("data::error"),
+              String::from(EXP_DATA_ERROR),
               JsonValue::String(maybe_json.as_ref().err().unwrap().to_string()),
             );
-            print!(
-              "{}{}",
-              this.config.out_sep,
-              err_output_fn(&json, cur_row_no)
-            );
+            let is_ok = if this.config.off_err_cond {
+              true
+            } else {
+              cond_fn(&json, cur_row_no)
+            };
+            if is_ok {
+              print!(
+                "{}{}",
+                this.config.out_sep,
+                err_output_fn(&json, cur_row_no)
+              );
+            }
           }
         });
       }) as BoxDynPrintFn
     };
     config.cap = cap;
     BufferedOutput {
+      index: 0,
       rows: 0,
       non_first: false,
       last_index: cap - 1,
@@ -651,7 +744,7 @@ impl BufferedOutput {
    */
   fn end(&self, is_end: bool) {
     let cap = self.config.cap;
-    let rows = if is_end { self.rows % cap } else { cap };
+    let rows = if is_end { self.index % cap } else { cap };
     let print_fn = &self.print_fn;
     if rows > 0 {
       print_fn(self, rows);
@@ -661,11 +754,12 @@ impl BufferedOutput {
    * push data
    */
   fn push(&mut self, row: String) {
+    self.rows += 1;
     if self.non_first {
-      let index = self.rows % self.config.cap;
+      let index = self.index % self.config.cap;
       self.data[index] = row;
-      self.rows += 1;
-      if self.rows + 1 == self.config.max_rows {
+      self.index += 1;
+      if self.index + 1 == self.config.max_rows {
         self.end(true);
         process::exit(0);
       } else if index == self.last_index {
@@ -676,20 +770,27 @@ impl BufferedOutput {
       let output_fn = &self.output_fn;
       let err_output_fn = &self.err_output_fn;
       let maybe_json = serde_json::from_str::<JsonData>(&row);
-      const LINE: usize = 1;
+      let rows = self.rows;
       if let Ok(json) = maybe_json {
-        if self.config.show_disp && cond_fn(&json, LINE) {
-          print!("{}", output_fn(&json, LINE));
+        if self.config.show_disp && cond_fn(&json, rows) {
+          print!("{}", output_fn(&json, rows));
           self.non_first = true;
         }
       } else if self.config.show_err_disp {
         let mut json = HashMap::new();
         json.insert(
-          String::from("data::error"),
+          String::from(EXP_DATA_ERROR),
           JsonValue::String(maybe_json.err().unwrap().to_string()),
         );
-        print!("{}", err_output_fn(&json, LINE));
-        self.non_first = true;
+        let is_ok = if self.config.off_err_cond {
+          true
+        } else {
+          cond_fn(&json, rows)
+        };
+        if is_ok {
+          print!("{}", err_output_fn(&json, rows));
+          self.non_first = true;
+        }
       }
       if self.config.max_rows == 1 {
         process::exit(0);
@@ -707,7 +808,7 @@ fn main() -> GenResult {
     let expr = evalexpr::build_operator_tree(&cond)
       .map_err(|e| format!("The --cond argument uses an unsupported expression:{}", e))?;
     // get the variable identifiers
-    let var_idents = expr
+    let mut var_idents = expr
       .iter_variable_identifiers()
       .into_iter()
       .map(|s| s.to_string())
@@ -718,7 +819,8 @@ fn main() -> GenResult {
       .into_iter()
       .map(|s| s.to_string())
       .collect::<Vec<_>>();
-    let has_row = var_idents.contains(&String::from(EXP_DATA_ROW));
+    // unique variable idents and remove the data::row
+    let has_row = unique_idents_rm_datarow(&mut var_idents);
     cond_use_row = has_row;
     Box::new(move |data: &JsonData, line| {
       let mut ctx_cond = evalexpr::HashMapContext::new();
@@ -745,6 +847,32 @@ fn main() -> GenResult {
                 return Ok(EvalValue::Boolean(keys.contains(&k)));
               }
               Ok(EvalValue::Boolean(false))
+            }),
+          )
+          .unwrap();
+      }
+      if fn_idents.contains(&String::from(EXP_STRING_FIND)) {
+        ctx_cond
+          .set_function(
+            EXP_STRING_FIND.into(),
+            Function::new(move |argument| {
+              if let Ok(args) = argument.as_tuple() {
+                let args_num = args.len();
+                if args_num == 2 || args_num == 3 {
+                  if let Ok(haystack) = args[0].as_string() {
+                    if let Ok(search) = args[1].as_string() {
+                      if args_num == 3 {
+                        if let Ok(index) = args[2].as_int() {
+                          return Ok(EvalValue::Int(string_find(&haystack, &search, index)));
+                        }
+                      } else {
+                        return Ok(EvalValue::Int(string_find(&haystack, &search, 0)));
+                      }
+                    }
+                  }
+                }
+              }
+              Ok(EvalValue::Int(-1))
             }),
           )
           .unwrap();
@@ -793,6 +921,7 @@ fn main() -> GenResult {
       show_disp,
       show_err_disp,
       no_use_row: !(cond_use_row || disp_use_row || err_disp_use_row),
+      off_err_cond: args.off_cond_err,
     },
     cond_fn,
     output_fn,
