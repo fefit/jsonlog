@@ -14,9 +14,15 @@ use std::str::Chars;
 use thiserror::Error;
 
 type JsonData = HashMap<String, JsonValue>;
-type BoxDynOutputFn = Box<dyn Fn(&JsonData) -> String + Send + Sync>;
-type BoxDynCondFn = Box<dyn Fn(&JsonData) -> bool + Send + Sync>;
+type BoxDynOutputFn = Box<dyn Fn(&JsonData, usize) -> String + Send + Sync>;
+type BoxDynCondFn = Box<dyn Fn(&JsonData, usize) -> bool + Send + Sync>;
+type BoxDynPrintFn = Box<dyn Fn(&BufferedOutput, usize) + Send + Sync>;
 type BoxDynError = Box<dyn StdError>;
+type GenResult<T = ()> = Result<T, BoxDynError>;
+
+const EXP_DATA_HAS_KEY: &str = "data::has_key";
+const EXP_DATA_ROW: &str = "data::row";
+
 #[derive(Error, Debug)]
 enum ArgumentError {
   #[error("{0}")]
@@ -35,18 +41,30 @@ const ESCAPE_CHARS: [(char, char); 9] = [
   ('b', 0x08 as char),
 ];
 
+/**
+ * escape normal characters
+ */
+fn escape_normal(ch: char) -> Option<char> {
+  for (orig, esc) in ESCAPE_CHARS {
+    if ch == orig {
+      return Some(esc);
+    }
+  }
+  None
+}
+
 #[inline]
 fn is_hex_char(ch: char) -> bool {
   matches!(ch, '0'..='9' | 'a'..='f' | 'A'..='F')
 }
 
 #[inline]
-fn hex_to_char(hex_str: &str) -> Result<char, BoxDynError> {
+fn hex_to_char(hex_str: &str) -> GenResult<char> {
   radix_str_to_char(hex_str, 16)
 }
 
 #[inline]
-fn radix_str_to_char(radix_str: &str, radix: u32) -> Result<char, BoxDynError> {
+fn radix_str_to_char(radix_str: &str, radix: u32) -> GenResult<char> {
   let code = u32::from_str_radix(radix_str, radix).unwrap();
   if let Some(ch) = std::char::from_u32(code) {
     return Ok(ch);
@@ -57,23 +75,14 @@ fn radix_str_to_char(radix_str: &str, radix: u32) -> Result<char, BoxDynError> {
   ))))
 }
 
-fn escape_normal(ch: char) -> Option<char> {
-  for (orig, esc) in ESCAPE_CHARS {
-    if ch == orig {
-      return Some(esc);
-    }
-  }
-  None
-}
-
 /**
- *
+ * parse \xhhh and octal \nnn
  */
 fn parse_maybe_still_in_escape(
   cur_str: &mut String,
   ch: char,
   escape_data: &mut EscapeData,
-) -> Result<bool, BoxDynError> {
+) -> GenResult<bool> {
   if let Some(esc) = &escape_data.escaped {
     let mut has_parsed = false;
     let (esc_end, radix) = match esc {
@@ -114,7 +123,7 @@ fn parse_in_escape(
   escape_data: &mut EscapeData,
   iter: &mut Chars,
   arg_name: &str,
-) -> Result<(), BoxDynError> {
+) -> GenResult {
   if let Some(next_ch) = iter.next() {
     if let Some(esc) = escape_normal(next_ch) {
       cur_str.push(esc);
@@ -243,10 +252,10 @@ fn parse_in_escape(
   Ok(())
 }
 
-fn parse_in_escape_end(
-  cur_str: &mut String,
-  escape_data: &mut EscapeData,
-) -> Result<(), BoxDynError> {
+/**
+ * parse the end
+ */
+fn parse_in_escape_end(cur_str: &mut String, escape_data: &mut EscapeData) -> GenResult {
   if let Some(esc) = &escape_data.escaped {
     let radix = if matches!(esc, EscapeRandWidth::Hex) {
       16
@@ -258,7 +267,10 @@ fn parse_in_escape_end(
   Ok(())
 }
 
-fn parse_escape_output(content: &str, arg_name: &str) -> Result<String, BoxDynError> {
+/**
+ * parse string with escaped
+ */
+fn parse_escape_output(content: &str, arg_name: &str) -> GenResult<String> {
   let mut cur_str = String::with_capacity(10);
   let mut escape_data = EscapeData::default();
   let mut iter = content.chars();
@@ -274,6 +286,152 @@ fn parse_escape_output(content: &str, arg_name: &str) -> Result<String, BoxDynEr
   }
   parse_in_escape_end(&mut cur_str, &mut escape_data)?;
   Ok(cur_str)
+}
+
+/**
+ * generate output fn
+ */
+fn gen_output_fn(tmpl: &str, arg_name: &str) -> GenResult<(bool, BoxDynOutputFn)> {
+  let mut output_fns: Vec<BoxDynOutputFn> = vec![];
+  let mut quote_char = '\0';
+  let mut maybe_escape = false;
+  let mut is_expr = false;
+  let mut cur_str = String::new();
+  let mut iter = tmpl.chars();
+  let mut escape_data = EscapeData::default();
+  let mut use_row = false;
+  // iterator over the display string
+  while let Some(ch) = iter.next() {
+    if is_expr {
+      // in expr
+      if quote_char != '\0' {
+        if quote_char == ch {
+          quote_char = '\0';
+        }
+      } else {
+        // not in quote
+        if ch == '}' {
+          let expr = evalexpr::build_operator_tree(&cur_str)?;
+          // get the variable identifiers
+          let var_idents = expr
+            .iter_variable_identifiers()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+          // get the function identifiers
+          let fn_idents = expr
+            .iter_function_identifiers()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+          // check if has data row variable
+          let has_row = var_idents.contains(&String::from(EXP_DATA_ROW));
+          // set whether use row
+          use_row = use_row || has_row;
+          // put output segments
+          output_fns.push(Box::new(move |data: &JsonData, line| {
+            let mut ctx_disp = evalexpr::HashMapContext::new();
+            // register variables, if not exist, registy an empty value
+            for key in &var_idents {
+              let value = if let Some(val) = data.get(key) {
+                ProxyValue::from(val).into()
+              } else {
+                EvalValue::Empty
+              };
+              ctx_disp.set_value(key.into(), value).unwrap();
+            }
+            if has_row {
+              ctx_disp
+                .set_value(EXP_DATA_ROW.into(), EvalValue::Int(line as i64))
+                .unwrap();
+            }
+            if fn_idents.contains(&String::from(EXP_DATA_HAS_KEY)) {
+              let keys = data.keys().cloned().collect::<Vec<_>>();
+              ctx_disp
+                .set_function(
+                  EXP_DATA_HAS_KEY.into(),
+                  Function::new(move |argument| {
+                    if let Ok(k) = argument.as_string() {
+                      return Ok(EvalValue::Boolean(keys.contains(&k)));
+                    }
+                    Ok(EvalValue::Boolean(false))
+                  }),
+                )
+                .unwrap();
+            }
+            if let Ok(value) = expr.eval_with_context(&ctx_disp) {
+              match value {
+                EvalValue::String(s) => s,
+                EvalValue::Empty => String::new(),
+                v => format!("{}", v),
+              }
+            } else {
+              String::new()
+            }
+          }));
+          cur_str = String::new();
+          is_expr = false;
+          continue;
+        } else if ch == '"' || ch == '\'' {
+          quote_char = ch;
+        }
+      }
+      cur_str.push(ch);
+    } else {
+      // special escape
+      if parse_maybe_still_in_escape(&mut cur_str, ch, &mut escape_data)? {
+        continue;
+      }
+      // not in expr
+      match ch {
+        '{' => {
+          if let Some(next_ch) = iter.next() {
+            if next_ch == '{' {
+              cur_str.push(ch);
+            } else {
+              if !cur_str.is_empty() {
+                let seg = std::mem::take(&mut cur_str);
+                output_fns.push(Box::new(move |_, _| seg.clone()));
+              }
+              cur_str.push(next_ch);
+              is_expr = true;
+            }
+          }
+        }
+        '}' => {
+          if maybe_escape {
+            maybe_escape = false;
+          } else {
+            maybe_escape = true;
+            cur_str.push(ch);
+          }
+        }
+        '\\' => {
+          parse_in_escape(&mut cur_str, ch, &mut escape_data, &mut iter, arg_name)?;
+        }
+        _ => {
+          cur_str.push(ch);
+        }
+      }
+    }
+  }
+  // at the end, the cur_str is not empty, should take as a string
+  parse_in_escape_end(&mut cur_str, &mut escape_data)?;
+  if !cur_str.is_empty() {
+    output_fns.push(Box::new(move |_, _| cur_str.clone()));
+  }
+  // generate output function
+  Ok((
+    use_row,
+    Box::new(move |data: &JsonData, line| {
+      let mut result = String::new();
+      for cb in output_fns.iter() {
+        let seg = cb(data, line);
+        result.push_str(&seg);
+      }
+      result
+    }),
+  ))
 }
 
 #[derive(Default)]
@@ -306,7 +464,11 @@ struct Args {
 
   /// Each data output display template
   #[arg(short = 'd', long)]
-  disp: String,
+  disp: Option<String>,
+
+  ///
+  #[arg(short = 'e', long)]
+  err_disp: Option<String>,
 
   /// Filter condition expression for each data
   #[arg(short = 'c', long)]
@@ -322,12 +484,6 @@ struct Args {
 
   /// The log file.
   file: Option<String>,
-}
-
-struct BufferedOutputConfig {
-  max_rows: usize,
-  cap: usize,
-  out_sep: String,
 }
 
 /**
@@ -376,14 +532,25 @@ impl From<ProxyValue> for EvalValue {
  * Buffered Output
  *
  */
+struct BufferedOutputConfig {
+  max_rows: usize,
+  cap: usize,
+  out_sep: String,
+  show_disp: bool,
+  show_err_disp: bool,
+  no_use_row: bool,
+}
+
 struct BufferedOutput {
-  output_fn: BoxDynOutputFn,
-  cond_fn: BoxDynCondFn,
-  data: Vec<String>,
+  non_first: bool,
   rows: usize,
   last_index: usize,
-  non_first: bool,
+  data: Vec<String>,
   config: BufferedOutputConfig,
+  cond_fn: BoxDynCondFn,
+  output_fn: BoxDynOutputFn,
+  err_output_fn: BoxDynOutputFn,
+  print_fn: BoxDynPrintFn,
 }
 
 impl BufferedOutput {
@@ -392,37 +559,102 @@ impl BufferedOutput {
    */
   fn new(
     mut config: BufferedOutputConfig,
-    output_fn: BoxDynOutputFn,
     cond_fn: BoxDynCondFn,
+    output_fn: BoxDynOutputFn,
+    err_output_fn: BoxDynOutputFn,
   ) -> Self {
     let cap = if config.cap == 0 { 1 } else { config.cap };
+    let print_fn = if config.no_use_row {
+      Box::new(|this: &BufferedOutput, rows: usize| {
+        let row_no = this.rows + 2;
+        let cond_fn = &this.cond_fn;
+        let output_fn = &this.output_fn;
+        let err_output_fn = &this.err_output_fn;
+        let result = this.data[0..rows]
+          .par_iter()
+          .map(|r| {
+            let maybe_json = serde_json::from_str::<JsonData>(r);
+            if let Ok(json) = maybe_json {
+              if this.config.show_disp && cond_fn(&json, row_no) {
+                return (
+                  true,
+                  format!("{}{}", this.config.out_sep, output_fn(&json, row_no)),
+                );
+              }
+            } else if this.config.show_err_disp {
+              let mut json = HashMap::new();
+              json.insert(
+                String::from("data::error"),
+                JsonValue::String(maybe_json.err().unwrap().to_string()),
+              );
+              return (
+                true,
+                format!("{}{}", this.config.out_sep, err_output_fn(&json, row_no)),
+              );
+            }
+            (false, String::new())
+          })
+          .collect::<Vec<(bool, String)>>();
+        result.iter().for_each(|(is_print, content)| {
+          if *is_print {
+            print!("{}", content);
+          }
+        });
+      })
+    } else {
+      Box::new(|this: &BufferedOutput, rows| {
+        let row_no = this.rows + 2;
+        let cond_fn = &this.cond_fn;
+        let output_fn = &this.output_fn;
+        let err_output_fn = &this.err_output_fn;
+        // just parallel the json parsing
+        let result = this.data[0..rows]
+          .par_iter()
+          .map(|r| serde_json::from_str::<JsonData>(r))
+          .collect::<Vec<_>>();
+        result.iter().enumerate().for_each(|(index, maybe_json)| {
+          let cur_row_no = row_no + index;
+          if let Ok(json) = maybe_json {
+            if this.config.show_disp && cond_fn(json, cur_row_no) {
+              print!("{}{}", this.config.out_sep, output_fn(json, cur_row_no));
+            }
+          } else if this.config.show_err_disp {
+            let mut json = HashMap::new();
+            json.insert(
+              String::from("data::error"),
+              JsonValue::String(maybe_json.as_ref().err().unwrap().to_string()),
+            );
+            print!(
+              "{}{}",
+              this.config.out_sep,
+              err_output_fn(&json, cur_row_no)
+            );
+          }
+        });
+      }) as BoxDynPrintFn
+    };
     config.cap = cap;
     BufferedOutput {
-      config,
-      last_index: cap - 1,
-      cond_fn,
-      output_fn,
-      data: vec![String::new(); cap],
       rows: 0,
       non_first: false,
+      last_index: cap - 1,
+      data: vec![String::new(); cap],
+      config,
+      cond_fn,
+      output_fn,
+      err_output_fn,
+      print_fn,
     }
   }
   /**
    * end
    */
-  fn end(&mut self, is_end: bool) {
+  fn end(&self, is_end: bool) {
     let cap = self.config.cap;
     let rows = if is_end { self.rows % cap } else { cap };
+    let print_fn = &self.print_fn;
     if rows > 0 {
-      let cond_fn = self.cond_fn.as_mut();
-      let output_fn = &self.output_fn;
-      self.data[0..rows].par_iter().for_each(|r| {
-        if let Ok(json) = serde_json::from_str::<JsonData>(r) {
-          if cond_fn(&json) {
-            print!("{}{}", self.config.out_sep, output_fn(&json));
-          }
-        }
-      });
+      print_fn(self, rows);
     }
   }
   /**
@@ -440,13 +672,24 @@ impl BufferedOutput {
         self.end(false);
       }
     } else {
-      let cond_fn = &mut self.cond_fn;
+      let cond_fn = &self.cond_fn;
       let output_fn = &self.output_fn;
-      if let Ok(json) = serde_json::from_str::<JsonData>(&row) {
-        if cond_fn(&json) {
-          print!("{}", output_fn(&json));
+      let err_output_fn = &self.err_output_fn;
+      let maybe_json = serde_json::from_str::<JsonData>(&row);
+      const LINE: usize = 1;
+      if let Ok(json) = maybe_json {
+        if self.config.show_disp && cond_fn(&json, LINE) {
+          print!("{}", output_fn(&json, LINE));
           self.non_first = true;
         }
+      } else if self.config.show_err_disp {
+        let mut json = HashMap::new();
+        json.insert(
+          String::from("data::error"),
+          JsonValue::String(maybe_json.err().unwrap().to_string()),
+        );
+        print!("{}", err_output_fn(&json, LINE));
+        self.non_first = true;
       }
       if self.config.max_rows == 1 {
         process::exit(0);
@@ -455,146 +698,11 @@ impl BufferedOutput {
   }
 }
 
-fn main() -> Result<(), BoxDynError> {
+fn main() -> GenResult {
+  // args
   let args = Args::parse();
-  let start_index = args.index;
-  let max_rows = if args.num == 0 { usize::MAX } else { args.num };
-  let out_sep = if let Some(out_sep) = args.out_sep {
-    parse_escape_output(&out_sep, "--out-sep")?
-  } else {
-    String::from("\n")
-  };
-  // build the display data
-  let mut output_fns: Vec<BoxDynOutputFn> = vec![];
-  {
-    let arg_name = "--disp";
-    let mut quote_char = '\0';
-    let mut maybe_escape = false;
-    let mut is_expr = false;
-    let mut cur_str = String::new();
-    let mut iter = args.disp.chars();
-    let mut escape_data = EscapeData::default();
-    // iterator over the display string
-    while let Some(ch) = iter.next() {
-      if is_expr {
-        // in expr
-        if quote_char != '\0' {
-          if quote_char == ch {
-            quote_char = '\0';
-          }
-        } else {
-          // not in quote
-          if ch == '}' {
-            let expr = evalexpr::build_operator_tree(&cur_str)?;
-            // get the variable identifiers
-            let var_idents = expr
-              .iter_variable_identifiers()
-              .into_iter()
-              .map(|s| s.to_string())
-              .collect::<Vec<_>>();
-            // get the function identifiers
-            let fn_idents = expr
-              .iter_function_identifiers()
-              .into_iter()
-              .map(|s| s.to_string())
-              .collect::<Vec<_>>();
-            output_fns.push(Box::new(move |data: &JsonData| {
-              let mut ctx_disp = evalexpr::HashMapContext::new();
-              // register variables, if not exist, registy an empty value
-              for key in &var_idents {
-                let value = if let Some(val) = data.get(key) {
-                  ProxyValue::from(val).into()
-                } else {
-                  EvalValue::Empty
-                };
-                ctx_disp.set_value(key.into(), value).unwrap();
-              }
-              if fn_idents.contains(&String::from("data::has_key")) {
-                let keys = data.keys().cloned().collect::<Vec<_>>();
-                ctx_disp
-                  .set_function(
-                    "data::has_key".into(),
-                    Function::new(move |argument| {
-                      if let Ok(k) = argument.as_string() {
-                        return Ok(EvalValue::Boolean(keys.contains(&k)));
-                      }
-                      Ok(EvalValue::Boolean(false))
-                    }),
-                  )
-                  .unwrap();
-              }
-              if let Ok(value) = expr.eval_with_context(&ctx_disp) {
-                match value {
-                  EvalValue::String(s) => s,
-                  EvalValue::Empty => String::new(),
-                  v => format!("{}", v),
-                }
-              } else {
-                String::new()
-              }
-            }));
-            cur_str = String::new();
-            is_expr = false;
-            continue;
-          } else if ch == '"' || ch == '\'' {
-            quote_char = ch;
-          }
-        }
-        cur_str.push(ch);
-      } else {
-        // special escape
-        if parse_maybe_still_in_escape(&mut cur_str, ch, &mut escape_data)? {
-          continue;
-        }
-        // not in expr
-        match ch {
-          '{' => {
-            if let Some(next_ch) = iter.next() {
-              if next_ch == '{' {
-                cur_str.push(ch);
-              } else {
-                if !cur_str.is_empty() {
-                  let seg = std::mem::take(&mut cur_str);
-                  output_fns.push(Box::new(move |_| seg.clone()));
-                }
-                cur_str.push(next_ch);
-                is_expr = true;
-              }
-            }
-          }
-          '}' => {
-            if maybe_escape {
-              maybe_escape = false;
-            } else {
-              maybe_escape = true;
-              cur_str.push(ch);
-            }
-          }
-          '\\' => {
-            parse_in_escape(&mut cur_str, ch, &mut escape_data, &mut iter, arg_name)?;
-          }
-          _ => {
-            cur_str.push(ch);
-          }
-        }
-      }
-    }
-    // at the end, the cur_str is not empty, should take as a string
-    parse_in_escape_end(&mut cur_str, &mut escape_data)?;
-    if !cur_str.is_empty() {
-      output_fns.push(Box::new(move |_| cur_str.clone()));
-    }
-  }
-  // generate output function
-  let output_fn = Box::new(move |data: &JsonData| {
-    let mut result = String::new();
-    for cb in output_fns.iter() {
-      let seg = cb(data);
-      result.push_str(&seg);
-    }
-    result
-  });
   // condition function
+  let mut cond_use_row = false;
   let cond_fn: BoxDynCondFn = if let Some(cond) = args.cond {
     let expr = evalexpr::build_operator_tree(&cond)
       .map_err(|e| format!("The --cond argument uses an unsupported expression:{}", e))?;
@@ -610,7 +718,9 @@ fn main() -> Result<(), BoxDynError> {
       .into_iter()
       .map(|s| s.to_string())
       .collect::<Vec<_>>();
-    Box::new(move |data: &JsonData| {
+    let has_row = var_idents.contains(&String::from(EXP_DATA_ROW));
+    cond_use_row = has_row;
+    Box::new(move |data: &JsonData, line| {
       let mut ctx_cond = evalexpr::HashMapContext::new();
       for key in &var_idents {
         let value = if let Some(val) = data.get(key) {
@@ -620,11 +730,16 @@ fn main() -> Result<(), BoxDynError> {
         };
         ctx_cond.set_value(key.into(), value).unwrap();
       }
-      if fn_idents.contains(&String::from("data::has_key")) {
+      if has_row {
+        ctx_cond
+          .set_value(EXP_DATA_ROW.into(), EvalValue::Int(line as i64))
+          .unwrap();
+      }
+      if fn_idents.contains(&String::from(EXP_DATA_HAS_KEY)) {
         let keys = data.keys().cloned().collect::<Vec<_>>();
         ctx_cond
           .set_function(
-            "data::has_key".into(),
+            EXP_DATA_HAS_KEY.into(),
             Function::new(move |argument| {
               if let Ok(k) = argument.as_string() {
                 return Ok(EvalValue::Boolean(keys.contains(&k)));
@@ -638,17 +753,50 @@ fn main() -> Result<(), BoxDynError> {
       bool_cond.unwrap_or(false)
     })
   } else {
-    Box::new(|_: &JsonData| true)
+    Box::new(|_, _| true)
   };
   // buffered output
+  let start_index = args.index;
+  let max_rows = if args.num == 0 { usize::MAX } else { args.num };
+  let out_sep = if let Some(out_sep) = args.out_sep {
+    parse_escape_output(&out_sep, "--out-sep")?
+  } else {
+    String::from("\n")
+  };
+  let (show_disp, (disp_use_row, output_fn)) = if let Some(tmpl) = args.disp {
+    (true, gen_output_fn(&tmpl, "--disp")?)
+  } else {
+    (
+      false,
+      (
+        false,
+        Box::new(|_: &JsonData, _| String::new()) as BoxDynOutputFn,
+      ),
+    )
+  };
+  let (show_err_disp, (err_disp_use_row, err_output_fn)) = if let Some(tmpl) = args.err_disp {
+    (true, gen_output_fn(&tmpl, "--err-disp")?)
+  } else {
+    (
+      false,
+      (
+        false,
+        Box::new(|_: &JsonData, _| String::new()) as BoxDynOutputFn,
+      ),
+    )
+  };
   let mut buf_output = BufferedOutput::new(
     BufferedOutputConfig {
       max_rows,
       cap: args.par.unwrap_or_else(num_cpus::get),
       out_sep,
+      show_disp,
+      show_err_disp,
+      no_use_row: !(cond_use_row || disp_use_row || err_disp_use_row),
     },
-    output_fn,
     cond_fn,
+    output_fn,
+    err_output_fn,
   );
   // read the logs from file
   if args.sep == "\n" {
