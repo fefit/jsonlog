@@ -542,6 +542,10 @@ struct Args {
   #[arg(short = 's', long, default_value_t = String::from("\n"))]
   sep: String,
 
+  /// The data seperator maximum matching character length
+  #[arg(short = 'm', long, default_value_t = 10)]
+  sep_max: usize,
+
   /// The output data seperator
   #[arg(short = 'j', long)]
   out_sep: Option<String>,
@@ -560,14 +564,14 @@ struct Args {
 
   /// Off condition expression for error data item
   #[arg(short = 'o', long)]
-  off_cond_err: bool,
+  off_err_cond: bool,
 
   /// Number of parallel buffered outputs
   #[arg(short = 'p', long)]
   par: Option<usize>,
 
   /// The total number of data
-  #[arg(short = 'n', long, default_value_t = usize::MAX)]
+  #[arg(short = 'n', long, default_value_t = 0)]
   num: usize,
 
   /// The log file.
@@ -1003,7 +1007,7 @@ fn main() -> GenResult {
       show_disp,
       show_err_disp,
       no_use_row: !(cond_use_row || disp_use_row || err_disp_use_row),
-      off_err_cond: args.off_cond_err,
+      off_err_cond: args.off_err_cond,
     },
     cond_fn,
     output_fn,
@@ -1047,12 +1051,13 @@ fn main() -> GenResult {
     let rule = Regex::new(&(String::from("(?m)") + &args.sep))
       .map_err(|e| format!("The --split argument is not a valid regex: {}", e))
       .unwrap();
+    let sep_max_len = if args.sep_max > 0 { args.sep_max } else { 1 };
     let mut buf_input = BufferedInput {
       non_first: false,
       start_row: start_index,
       pushed_row: 0,
       prev_index: 0,
-      sep_max_len: 10,
+      sep_max_len,
       last_content: String::with_capacity(100),
       rule,
     };
