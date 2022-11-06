@@ -18,5 +18,7 @@ serde_json = "1.0.87"
 thiserror = "1.0.37"
 
 [profile.release]
+opt-level = 'z'
 panic = "abort"
-lto = false
+lto = true
+codegen-units = 1

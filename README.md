@@ -51,6 +51,27 @@ jsonlog json.log -e '{data::row}'
 # ------------------------
 ```
 
+# installation
+
+## On Mac
+
+```bash
+# use homebrew
+brew tap fefit/jsonlog
+brew install jsonlog
+# donwload the binary file
+curl -OL https://github.com/fefit/jsonlog/releases/download/v0.1.0/jsonlog-mac-0.1.0.tar.gz -o jsonlog.tar.gz
+tar -zxvf jsonlog.tar.gz
+mv jsonlog /usr/local/bin
+```
+## On linux
+
+```bash
+curl -OL https://github.com/fefit/jsonlog/releases/download/v0.1.0/jsonlog-linux-0.1.0.tar.gz -o jsonlog.tar.gz
+tar -zxvf jsonlog.tar.gz
+sudo mv jsonlog /usr/local/bin
+```
+
 ## cli options
 
 | argument       | short | description                                                                                                                                                                                                                                                                                  |
