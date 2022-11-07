@@ -6,7 +6,11 @@ A command line tool that simplifies parsing json data type logs.
 
 ```bash
 # json logs
-echo '{ "name": "json", "value": 1 }\n{ "name": "log", "value": 3 }\n{ "name": "demo", "value": 5}' > json.log
+cat <<EOT > json.log
+{ "name": "json", "value": 1 }
+{ "name": "log", "value": 3 }
+{ "name": "demo", "value": 5}
+EOT
 # use --disp(-d for short) to define the data output template
 # use '{}' curly braces to wrap output field expression
 jsonlog json.log -d '{name}\t{value + 1}'
@@ -47,7 +51,7 @@ jsonlog json.log -d '{name}' -e '{data::error}'
 # output only error lines
 jsonlog json.log -e '{data::row}'
 # ---------output---------
-4
+# 4
 # ------------------------
 ```
 
@@ -64,6 +68,7 @@ curl -OL https://github.com/fefit/jsonlog/releases/download/v0.1.0/jsonlog-mac-0
 tar -zxvf jsonlog.tar.gz
 mv jsonlog /usr/local/bin
 ```
+
 ## On linux
 
 ```bash
@@ -90,18 +95,18 @@ sudo mv jsonlog /usr/local/bin
 
 `jsonlog` uses the awesome crate [`evalexpr`](https://github.com/ISibboI/evalexpr) to provide expression support, so the builtin expression syntax and functions are supported, in addtion, some built-in data-related variables and methods are provided.
 
-| keyword  | type  | --cond | --disp | --err-disp | description |
-| :------- | :---- | :---------- | :------ | :--- | :---------- |
-| `data::has_key(string, ...string)` | function | ✓ | ✓ | ✓ | judge if the json data item has the specified keys. |
-| `data::row` | variable | ✓ | ✓ | ✓ | the row number of the json data item, becareful to use only when needed, it will affect part of the parallel performance. |
-| `data::error` | variable | x | x | ✓ | show the json parsing error of the error data item. |
-| `string::find(haystack, search, [index])` | function | ✓ | x | x | find the position of the `search` string in the `haystack` |
+| keyword                                   | type     | --cond | --disp | --err-disp | description                                                                                                               |
+| :---------------------------------------- | :------- | :----- | :----- | :--------- | :------------------------------------------------------------------------------------------------------------------------ |
+| `data::has_key(string, ...string)`        | function | ✓      | ✓      | ✓          | judge if the json data item has the specified keys.                                                                       |
+| `data::row`                               | variable | ✓      | ✓      | ✓          | the row number of the json data item, becareful to use only when needed, it will affect part of the parallel performance. |
+| `data::error`                             | variable | x      | x      | ✓          | show the json parsing error of the error data item.                                                                       |
+| `string::find(haystack, search, [index])` | function | ✓      | x      | x          | find the position of the `search` string in the `haystack`                                                                |
 
-More functions please see the crate evalexpr's[ README](https://github.com/ISibboI/evalexpr#builtin-functions)
+More functions please see the crate [evalexpr's README](https://github.com/ISibboI/evalexpr#builtin-functions)
 
 ## Questions & Bugs?
 
-Welcome to report to us with issue if you meet any question or bug. [Issue](https://github.com/suchjs/nprintf/issues)
+Welcome to report to us with issue if you meet any question or bug. [Issue](https://github.com/fefit/jsonlog/issues)
 
 ## License
 
